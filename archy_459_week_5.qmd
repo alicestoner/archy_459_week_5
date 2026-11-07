@@ -1,0 +1,246 @@
+---
+title: "archy_459_week_5.qmd"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(rsample)
+library(yardstick)
+library(torch)
+library(torchvision)
+library(luz)
+library(magick)
+```
+
+## import the data 
+
+```{r}
+tww_file <- "data/CNN-Models-Supplement/TWW_data.xlsx"
+image_dir <- "data/Single_Sherd_8_Type_Analyzer/Reference_database/Reference_Images"
+
+tww <- read_excel(tww_file)
+```
+
+recall that in the paper the human experts agree with the conc=sensus about 74-87% of the time
+
+## display one representative sherd per type
+
+## asked opencode to put the code below
+
+```{r display-sherd-types, out.width='100%', fig.cap="Eight Tusayan White Ware Types – One Representative Sherd Each"}
+library(magick)
+
+BASE_DIR <- "data/Single_Sherd_8_Type_Analyzer/Reference_Database/Reference_Images"
+
+TYPE_IMAGES <- c(
+  "Black Mesa B/W" = "PP_Tusayan_132.jpg",
+  "Dogoszhi B/W" = "PP_Tusayan_134.jpg",
+  "Flagstaff B/W" = "PP_Tusayan_136.jpg",
+  "Kayenta B/W" = "PP_Tusayan_138.jpg",
+  "Pueblo II B/W (Tusayan)" = "PP_Tusayan_141.jpg",
+  "Pueblo III B/W (Tusayan)" = "PP_Tusayan_145.jpg",
+  "Sosi B/W" = "Sosi_1.jpg",
+  "Wupatki B/W" = "PP_Wupatki_001.jpg"
+)
+
+# Read and resize all images, then plot in a 4×2 grid
+imgs <- lapply(TYPE_IMAGES, function(path) {
+  img <- image_read(file.path(BASE_DIR, path))
+  img %>% image_scale("200x200")
+})
+
+n <- length(imgs)
+nrows <- 4
+ncols <- 2
+
+par(mfrow = c(nrows, ncols), mar = c(2, 2, 2, 2) + 0.1)
+
+for (i in seq_along(imgs)) {
+  plot(imgs[[i]], main = names(imgs[i]), cex.main = 0.8)
+}
+
+par(mfrow = c(1, 1))
+```
+
+## get the sherd images and labels
+
+
+```{r}
+type_levels <- c("Kanaa", "Wepo", "Black_Mesa", "Sosi", "Dogoszhi", "Flagstaff", "Tusayan", "Kayenta")
+
+sherds <- tww |>
+  transmute(
+    image = image_file,
+    type = factor(`Human consensus`, levels = type_levels),
+    paper_prediction = `CNN model prediction`
+  ) |>
+  mutate(path = file.path(image_dir, image))
+
+count(sherds, type)
+```
+
+```{r}
+#| label: sample-prop
+
+sample_prop <- 0.1
+
+set.seed(459)
+sherd_sample <- sherds |>
+  group_by(type) |>
+  slice_sample(prop = sample_prop) |>
+  ungroup()
+
+count(sherd_sample, type)
+
+```
+
+## split the data into test and training set 
+
+```{r}
+set.seed(459)
+sherd_split <- initial_split(sherd_sample, prop = 0.8, strata = type)
+train_df <- training(sherd_split)
+test_df <- testing(sherd_split)
+
+nrow(train_df)
+nrow(test_df)
+```
+
+the training set has `r nrow(train_df)` sherds and the test set has `r nrow(train_df)`
+
+## prepare the images and augment them 
+
+`
+```{r}
+source("sherd_helpers.R")
+train_dl <- dataloader(sherd_dataset(train_df, 
+                                     augment = TRUE), 
+                       batch_size = 32, 
+                       shuffle = TRUE)
+
+test_dl <- dataloader(sherd_dataset(test_df, 
+                                    augment = FALSE),
+                      batch_size = 64)
+```
+
+## transfer learning with a pretrained CNN
+
+```{r}
+sherd_net <- nn_module(
+  initialize = function() {
+    self$resnet <- model_resnet18(pretrained = TRUE)
+    self$resnet$fc <- nn_linear(512, 8) # fc refers to the Fully Connected layer
+  },
+  forward = function(x) self$resnet(x)
+)
+```
+
+## train the network
+
+```{r}
+torch_manual_seed(459)
+
+fitted <- sherd_net |>
+  setup(
+    loss = nn_cross_entropy_loss(),
+    optimizer = optim_adam,
+    metrics = luz_metric_accuracy()
+  ) |>
+  set_opt_hparams(lr = 0.0001) |>
+  fit(train_dl, epochs = 15, valid_data = test_dl, verbose = FALSE)
+```
+
+## save the trained model
+```{r}
+luz_save(fitted, "sherd_model.luz")
+
+```
+
+## evaluate model on the test set 
+
+```{r}
+test_logits <- predict(fitted, test_dl)
+test_probs <- as_array(nnf_softmax(test_logits, dim = 2)$cpu())
+
+test_results <- test_df |>
+  mutate(predicted = factor(type_levels[max.col(test_probs)], levels = type_levels))
+
+accuracy(test_results, truth = type, estimate = predicted)
+```
+
+## compare with the paper
+```{r}
+comparison <- tibble(
+  classifier = c("Our ResNet18", "Paper's CNN ensemble"),
+  agreement = c(
+    mean(test_results$predicted == test_results$type),
+    mean(test_results$paper_prediction == test_results$type)
+  )
+)
+```
+
+## calculate a confusion matrix 
+```{r}
+confusion <- test_results |>
+
+  count(type, predicted) |>
+
+  complete(type, predicted, fill = list(n = 0))
+```
+
+## confusion matrix heatmap
+```{r}
+library(ggplot2)
+
+ggplot(data = confusion, aes(x = predicted, y = type, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), color = "white", size = 4, fontface = "bold") +
+  scale_fill_viridis_c(option = "inferno", guide = "none") +
+  labs(
+    title = "Confusion Matrix",
+    x = "Predicted",
+    y = "Actual"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+## confusion matrix heatmap
+```{r}
+library(ggplot2)
+
+# Create confusion matrix from test_results
+confusion <- test_results |>
+  count(type, predicted) |>
+  complete(type, predicted, fill = list(n = 0))
+
+# Determine text color: white for dark cells (high n), black for light cells
+confusion <- confusion |>
+  mutate(text_color = ifelse(n > median(n), "white", "black"))
+
+ggplot(data = confusion, aes(x = predicted, y = type, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n, color = text_color), size = 4, fontface = "bold") +
+  scale_color_identity() +
+  scale_fill_viridis_c(option = "inferno", guide = "none") +
+  labs(
+    title = "Confusion Matrix",
+    x = "Predicted",
+    y = "Actual"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Our models accuracy is not within the human range. It is actually lower than the human range in the study. I think this is a fair way to judge CNN because classifying pottery types is very difficult as they diffuse into each other, with styles gradually changing over time. Perhaps CNN is not beneficial for these types of classification.
+
+The type Tusayan and Flaggstaff are confused most often. They are neighbors in time because they are often missclassified as each other. This suggests Tusayan and Flagstaff are very similar so they might not be two distict groups, but rather one group. 
